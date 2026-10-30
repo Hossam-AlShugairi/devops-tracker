@@ -1,25 +1,40 @@
-import { DatabaseSync } from 'node:sqlite';
+import { createClient, Client } from '@libsql/client';
 import path from 'node:path';
 import fs from 'node:fs';
 import { SEED_COURSES } from '../../shared/seedData';
 import bcrypt from 'bcryptjs';
 
-const DB_PATH = process.env.DATABASE_PATH || path.resolve(process.cwd(), 'data', 'tracker.db');
+const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL;
+const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN;
 
-// Ensure data directory exists
-const dbDir = path.dirname(DB_PATH);
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
+let client: Client;
+
+if (TURSO_DATABASE_URL) {
+  // Use Turso Cloud SQLite database on Vercel
+  client = createClient({
+    url: TURSO_DATABASE_URL,
+    authToken: TURSO_AUTH_TOKEN,
+  });
+} else {
+  // Use local file SQLite database for local development
+  const localDbPath = process.env.DATABASE_PATH || path.resolve(process.cwd(), 'data', 'tracker.db');
+  const dbDir = path.dirname(localDbPath);
+  if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+  }
+  client = createClient({
+    url: `file:${localDbPath.replace(/\\/g, '/')}`,
+  });
 }
 
-export const db = new DatabaseSync(DB_PATH);
+export const db = client;
 
-// Enable WAL mode for better concurrency and performance
-db.exec('PRAGMA journal_mode = WAL;');
-db.exec('PRAGMA foreign_keys = ON;');
+let initialized = false;
 
-export function initDatabase() {
-  db.exec(`
+export async function initDatabase() {
+  if (initialized) return;
+
+  await db.executeMultiple(`
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -56,51 +71,60 @@ export function initDatabase() {
   `);
 
   // Default settings
-  const getSetting = db.prepare('SELECT value FROM settings WHERE key = ?');
-  const setSetting = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
+  const checkSetting = async (key: string, defaultValue: string) => {
+    const rs = await db.execute({ sql: 'SELECT value FROM settings WHERE key = ?', args: [key] });
+    if (rs.rows.length === 0) {
+      await db.execute({
+        sql: 'INSERT INTO settings (key, value) VALUES (?, ?)',
+        args: [key, defaultValue],
+      });
+    }
+  };
 
-  if (!getSetting.get('planStartDate')) {
-    setSetting.run('planStartDate', '2026-11-06');
-  }
-  if (!getSetting.get('targetDailyHours')) {
-    setSetting.run('targetDailyHours', '2');
-  }
-  if (!getSetting.get('showPhase2')) {
-    setSetting.run('showPhase2', '0');
-  }
+  await checkSetting('planStartDate', '2026-11-06');
+  await checkSetting('targetDailyHours', '2');
+  await checkSetting('showPhase2', '0');
 
-  // Check if admin password is set; default password from env or 'devops2027'
-  if (!getSetting.get('passwordHash')) {
+  // Check admin password
+  const passRs = await db.execute({ sql: 'SELECT value FROM settings WHERE key = ?', args: ['passwordHash'] });
+  if (passRs.rows.length === 0) {
     const defaultPassword = process.env.APP_PASSWORD || 'devops2027';
     const salt = bcrypt.genSaltSync(10);
     const hash = bcrypt.hashSync(defaultPassword, salt);
-    setSetting.run('passwordHash', hash);
+    await db.execute({
+      sql: 'INSERT INTO settings (key, value) VALUES (?, ?)',
+      args: ['passwordHash', hash],
+    });
   }
 
-  // Seed courses and topics if courses table is empty
-  const courseCountRow = db.prepare('SELECT COUNT(*) as count FROM courses').get() as { count: number };
-  if (courseCountRow.count === 0) {
-    seedDatabase();
+  // Seed courses and topics if empty
+  const countRs = await db.execute('SELECT COUNT(*) as count FROM courses');
+  const count = Number(countRs.rows[0]?.count || 0);
+  if (count === 0) {
+    await seedDatabase();
   }
+
+  initialized = true;
 }
 
-export function seedDatabase() {
-  const insertCourse = db.prepare(
-    'INSERT INTO courses (id, name, color, order_index, phase, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-  );
-  const insertTopic = db.prepare(
-    'INSERT INTO topics (id, course_id, title, due_date, completed, completed_at, notes, order_index) VALUES (?, ?, ?, ?, 0, NULL, NULL, ?)'
-  );
-
+export async function seedDatabase() {
   const nowIso = new Date().toISOString();
 
-  SEED_COURSES.forEach((course, courseIndex) => {
-    const courseId = `course-${courseIndex + 1}`;
-    insertCourse.run(courseId, course.name, course.color, courseIndex, course.phase, nowIso);
-
-    course.topics.forEach((topic, topicIndex) => {
-      const topicId = `${courseIndex}-${topicIndex}`;
-      insertTopic.run(topicId, courseId, topic.title, topic.dueDate, topicIndex);
+  for (let ci = 0; ci < SEED_COURSES.length; ci++) {
+    const course = SEED_COURSES[ci];
+    const courseId = `course-${ci + 1}`;
+    await db.execute({
+      sql: 'INSERT INTO courses (id, name, color, order_index, phase, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      args: [courseId, course.name, course.color, ci, course.phase, nowIso],
     });
-  });
+
+    for (let ti = 0; ti < course.topics.length; ti++) {
+      const topic = course.topics[ti];
+      const topicId = `${ci}-${ti}`;
+      await db.execute({
+        sql: 'INSERT INTO topics (id, course_id, title, due_date, completed, completed_at, notes, order_index) VALUES (?, ?, ?, ?, 0, NULL, NULL, ?)',
+        args: [topicId, courseId, topic.title, topic.dueDate, ti],
+      });
+    }
+  }
 }

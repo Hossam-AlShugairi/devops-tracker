@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { db } from './db';
+import { db, initDatabase } from './db';
 import { authMiddleware, signToken } from './auth';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
@@ -14,6 +14,16 @@ import crypto from 'node:crypto';
 
 export const apiRouter = Router();
 
+// Middleware to ensure DB is initialized
+apiRouter.use(async (_req, _res, next) => {
+  try {
+    await initDatabase();
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ==========================================
 // Authentication Routes
 // ==========================================
@@ -22,7 +32,7 @@ const loginSchema = z.object({
   password: z.string().min(1, 'كلمة المرور مطلوبة'),
 });
 
-apiRouter.post('/auth/login', (req: Request, res: Response): void => {
+apiRouter.post('/auth/login', async (req: Request, res: Response): Promise<void> => {
   const result = loginSchema.safeParse(req.body);
   if (!result.success) {
     res.status(400).json({ error: result.error.errors[0].message });
@@ -30,9 +40,10 @@ apiRouter.post('/auth/login', (req: Request, res: Response): void => {
   }
 
   const { password } = result.data;
-  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('passwordHash') as { value: string } | undefined;
+  const rs = await db.execute({ sql: 'SELECT value FROM settings WHERE key = ?', args: ['passwordHash'] });
+  const row = rs.rows[0];
 
-  if (!row || !bcrypt.compareSync(password, row.value)) {
+  if (!row || !bcrypt.compareSync(password, String(row.value))) {
     res.status(401).json({ error: 'كلمة المرور غير صحيحة.' });
     return;
   }
@@ -44,7 +55,7 @@ apiRouter.post('/auth/login', (req: Request, res: Response): void => {
     httpOnly: true,
     secure: isProduction,
     sameSite: 'lax',
-    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+    maxAge: 30 * 24 * 60 * 60 * 1000,
   });
 
   res.json({ success: true, message: 'تم تسجيل الدخول بنجاح' });
@@ -77,11 +88,11 @@ apiRouter.use(authMiddleware);
 // Settings Routes
 // ==========================================
 
-apiRouter.get('/settings', (_req: Request, res: Response) => {
-  const rows = db.prepare('SELECT key, value FROM settings').all() as { key: string; value: string }[];
+apiRouter.get('/settings', async (_req: Request, res: Response) => {
+  const rs = await db.execute('SELECT key, value FROM settings');
   const settingsMap: Record<string, string> = {};
-  for (const r of rows) {
-    settingsMap[r.key] = r.value;
+  for (const r of rs.rows) {
+    settingsMap[String(r.key)] = String(r.value);
   }
 
   const response: UserSettings = {
@@ -100,7 +111,7 @@ const updateSettingsSchema = z.object({
   showPhase2: z.boolean().optional(),
 });
 
-apiRouter.patch('/settings', (req: Request, res: Response): void => {
+apiRouter.patch('/settings', async (req: Request, res: Response): Promise<void> => {
   const result = updateSettingsSchema.safeParse(req.body);
   if (!result.success) {
     res.status(400).json({ error: result.error.errors[0].message });
@@ -108,16 +119,24 @@ apiRouter.patch('/settings', (req: Request, res: Response): void => {
   }
 
   const { planStartDate, targetDailyHours, showPhase2 } = result.data;
-  const updateSetting = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
 
   if (planStartDate !== undefined) {
-    updateSetting.run('planStartDate', planStartDate);
+    await db.execute({
+      sql: 'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+      args: ['planStartDate', planStartDate],
+    });
   }
   if (targetDailyHours !== undefined) {
-    updateSetting.run('targetDailyHours', targetDailyHours.toString());
+    await db.execute({
+      sql: 'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+      args: ['targetDailyHours', targetDailyHours.toString()],
+    });
   }
   if (showPhase2 !== undefined) {
-    updateSetting.run('showPhase2', showPhase2 ? '1' : '0');
+    await db.execute({
+      sql: 'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+      args: ['showPhase2', showPhase2 ? '1' : '0'],
+    });
   }
 
   res.json({ success: true, message: 'تم تحديث الإعدادات بنجاح' });
@@ -128,7 +147,7 @@ const changePasswordSchema = z.object({
   newPassword: z.string().min(4, 'كلمة المرور الجديدة يجب أن تكون 4 أحرف على الأقل'),
 });
 
-apiRouter.post('/settings/change-password', (req: Request, res: Response): void => {
+apiRouter.post('/settings/change-password', async (req: Request, res: Response): Promise<void> => {
   const result = changePasswordSchema.safeParse(req.body);
   if (!result.success) {
     res.status(400).json({ error: result.error.errors[0].message });
@@ -136,16 +155,20 @@ apiRouter.post('/settings/change-password', (req: Request, res: Response): void 
   }
 
   const { currentPassword, newPassword } = result.data;
-  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('passwordHash') as { value: string } | undefined;
+  const rs = await db.execute({ sql: 'SELECT value FROM settings WHERE key = ?', args: ['passwordHash'] });
+  const row = rs.rows[0];
 
-  if (!row || !bcrypt.compareSync(currentPassword, row.value)) {
+  if (!row || !bcrypt.compareSync(currentPassword, String(row.value))) {
     res.status(400).json({ error: 'كلمة المرور الحالية غير صحيحة' });
     return;
   }
 
   const salt = bcrypt.genSaltSync(10);
   const hash = bcrypt.hashSync(newPassword, salt);
-  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('passwordHash', hash);
+  await db.execute({
+    sql: 'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+    args: ['passwordHash', hash],
+  });
 
   res.json({ success: true, message: 'تم تغيير كلمة المرور بنجاح' });
 });
@@ -154,31 +177,23 @@ apiRouter.post('/settings/change-password', (req: Request, res: Response): void 
 // Courses Routes
 // ==========================================
 
-apiRouter.get('/courses', (_req: Request, res: Response) => {
-  const showPhase2Row = db.prepare('SELECT value FROM settings WHERE key = ?').get('showPhase2') as { value: string } | undefined;
-  const showPhase2 = showPhase2Row?.value === '1';
+apiRouter.get('/courses', async (_req: Request, res: Response) => {
+  const showPhase2Rs = await db.execute({ sql: 'SELECT value FROM settings WHERE key = ?', args: ['showPhase2'] });
+  const showPhase2 = showPhase2Rs.rows[0]?.value === '1';
 
-  let query = 'SELECT * FROM courses ORDER BY phase ASC, order_index ASC';
+  let sql = 'SELECT * FROM courses ORDER BY phase ASC, order_index ASC';
   if (!showPhase2) {
-    query = 'SELECT * FROM courses WHERE phase = 1 ORDER BY order_index ASC';
+    sql = 'SELECT * FROM courses WHERE phase = 1 ORDER BY order_index ASC';
   }
 
-  const rows = db.prepare(query).all() as Array<{
-    id: string;
-    name: string;
-    color: string;
-    order_index: number;
-    phase: number;
-    created_at: string;
-  }>;
-
-  const courses: Course[] = rows.map((r) => ({
-    id: r.id,
-    name: r.name,
-    color: r.color,
-    orderIndex: r.order_index,
-    phase: r.phase,
-    createdAt: r.created_at,
+  const rs = await db.execute(sql);
+  const courses: Course[] = rs.rows.map((r: any) => ({
+    id: String(r.id),
+    name: String(r.name),
+    color: String(r.color),
+    orderIndex: Number(r.order_index),
+    phase: Number(r.phase),
+    createdAt: String(r.created_at),
   }));
 
   res.json(courses);
@@ -190,7 +205,7 @@ const courseSchema = z.object({
   phase: z.number().int().min(1).max(2).default(1),
 });
 
-apiRouter.post('/courses', (req: Request, res: Response): void => {
+apiRouter.post('/courses', async (req: Request, res: Response): Promise<void> => {
   const result = courseSchema.safeParse(req.body);
   if (!result.success) {
     res.status(400).json({ error: result.error.errors[0].message });
@@ -199,54 +214,44 @@ apiRouter.post('/courses', (req: Request, res: Response): void => {
 
   const { name, color, phase } = result.data;
   const id = `course-${crypto.randomUUID().slice(0, 8)}`;
-  const countRow = db.prepare('SELECT COUNT(*) as cnt FROM courses WHERE phase = ?').get(phase) as { cnt: number };
-  const orderIndex = countRow.cnt;
+  const countRs = await db.execute({ sql: 'SELECT COUNT(*) as cnt FROM courses WHERE phase = ?', args: [phase] });
+  const orderIndex = Number(countRs.rows[0]?.cnt || 0);
   const createdAt = new Date().toISOString();
 
-  db.prepare('INSERT INTO courses (id, name, color, order_index, phase, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(
-    id,
-    name,
-    color,
-    orderIndex,
-    phase,
-    createdAt
-  );
+  await db.execute({
+    sql: 'INSERT INTO courses (id, name, color, order_index, phase, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    args: [id, name, color, orderIndex, phase, createdAt],
+  });
 
   res.status(201).json({ id, name, color, orderIndex, phase, createdAt });
 });
 
-apiRouter.patch('/courses/:id', (req: Request, res: Response): void => {
+apiRouter.patch('/courses/:id', async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
-  const updateCourseSchema = courseSchema.partial();
-  const result = updateCourseSchema.safeParse(req.body);
+  const result = courseSchema.partial().safeParse(req.body);
   if (!result.success) {
     res.status(400).json({ error: result.error.errors[0].message });
     return;
   }
 
   const { name, color, phase } = result.data;
-  const existing = db.prepare('SELECT * FROM courses WHERE id = ?').get(id);
-  if (!existing) {
-    res.status(404).json({ error: 'الكورس غير موجود' });
-    return;
-  }
-
   if (name !== undefined) {
-    db.prepare('UPDATE courses SET name = ? WHERE id = ?').run(name, id);
+    await db.execute({ sql: 'UPDATE courses SET name = ? WHERE id = ?', args: [name, id] });
   }
   if (color !== undefined) {
-    db.prepare('UPDATE courses SET color = ? WHERE id = ?').run(color, id);
+    await db.execute({ sql: 'UPDATE courses SET color = ? WHERE id = ?', args: [color, id] });
   }
   if (phase !== undefined) {
-    db.prepare('UPDATE courses SET phase = ? WHERE id = ?').run(phase, id);
+    await db.execute({ sql: 'UPDATE courses SET phase = ? WHERE id = ?', args: [phase, id] });
   }
 
   res.json({ success: true, message: 'تم تحديث الكورس' });
 });
 
-apiRouter.delete('/courses/:id', (req: Request, res: Response): void => {
+apiRouter.delete('/courses/:id', async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
-  db.prepare('DELETE FROM courses WHERE id = ?').run(id);
+  await db.execute({ sql: 'DELETE FROM topics WHERE course_id = ?', args: [id] });
+  await db.execute({ sql: 'DELETE FROM courses WHERE id = ?', args: [id] });
   res.json({ success: true, message: 'تم حذف الكورس وجميع مواضيعه' });
 });
 
@@ -254,52 +259,39 @@ apiRouter.delete('/courses/:id', (req: Request, res: Response): void => {
 // Topics Routes
 // ==========================================
 
-function getAllTopicsWithCourse(showPhase2: boolean): TopicWithCourse[] {
-  let query = `
+async function getAllTopicsWithCourse(showPhase2: boolean): Promise<TopicWithCourse[]> {
+  let sql = `
     SELECT t.id, t.course_id, t.title, t.due_date, t.completed, t.completed_at, t.notes, t.order_index,
            c.name as course_name, c.color as course_color, c.phase as course_phase
     FROM topics t
     JOIN courses c ON t.course_id = c.id
   `;
   if (!showPhase2) {
-    query += ' WHERE c.phase = 1';
+    sql += ' WHERE c.phase = 1';
   }
-  query += ' ORDER BY t.due_date ASC, t.order_index ASC';
+  sql += ' ORDER BY t.due_date ASC, t.order_index ASC';
 
-  const rows = db.prepare(query).all() as Array<{
-    id: string;
-    course_id: string;
-    title: string;
-    due_date: string;
-    completed: number;
-    completed_at: string | null;
-    notes: string | null;
-    order_index: number;
-    course_name: string;
-    course_color: string;
-    course_phase: number;
-  }>;
-
-  return rows.map((r) => ({
-    id: r.id,
-    courseId: r.course_id,
-    title: r.title,
-    dueDate: r.due_date,
-    completed: r.completed === 1,
-    completedAt: r.completed_at,
-    notes: r.notes,
-    orderIndex: r.order_index,
-    courseName: r.course_name,
-    courseColor: r.course_color,
-    coursePhase: r.course_phase,
+  const rs = await db.execute(sql);
+  return rs.rows.map((r: any) => ({
+    id: String(r.id),
+    courseId: String(r.course_id),
+    title: String(r.title),
+    dueDate: String(r.due_date),
+    completed: Number(r.completed) === 1,
+    completedAt: r.completed_at ? String(r.completed_at) : null,
+    notes: r.notes ? String(r.notes) : null,
+    orderIndex: Number(r.order_index),
+    courseName: String(r.course_name),
+    courseColor: String(r.course_color),
+    coursePhase: Number(r.course_phase),
   }));
 }
 
-apiRouter.get('/topics', (_req: Request, res: Response) => {
-  const showPhase2Row = db.prepare('SELECT value FROM settings WHERE key = ?').get('showPhase2') as { value: string } | undefined;
-  const showPhase2 = showPhase2Row?.value === '1';
+apiRouter.get('/topics', async (_req: Request, res: Response) => {
+  const showPhase2Rs = await db.execute({ sql: 'SELECT value FROM settings WHERE key = ?', args: ['showPhase2'] });
+  const showPhase2 = showPhase2Rs.rows[0]?.value === '1';
 
-  const topics = getAllTopicsWithCourse(showPhase2);
+  const topics = await getAllTopicsWithCourse(showPhase2);
   res.json(topics);
 });
 
@@ -310,7 +302,7 @@ const topicCreateSchema = z.object({
   notes: z.string().optional().nullable(),
 });
 
-apiRouter.post('/topics', (req: Request, res: Response): void => {
+apiRouter.post('/topics', async (req: Request, res: Response): Promise<void> => {
   const result = topicCreateSchema.safeParse(req.body);
   if (!result.success) {
     res.status(400).json({ error: result.error.errors[0].message });
@@ -318,24 +310,25 @@ apiRouter.post('/topics', (req: Request, res: Response): void => {
   }
 
   const { courseId, title, dueDate, notes } = result.data;
-  const course = db.prepare('SELECT id FROM courses WHERE id = ?').get(courseId);
-  if (!course) {
+  const courseRs = await db.execute({ sql: 'SELECT id FROM courses WHERE id = ?', args: [courseId] });
+  if (courseRs.rows.length === 0) {
     res.status(404).json({ error: 'الكورس غير موجود' });
     return;
   }
 
   const id = `topic-${crypto.randomUUID().slice(0, 8)}`;
-  const countRow = db.prepare('SELECT COUNT(*) as cnt FROM topics WHERE course_id = ?').get(courseId) as { cnt: number };
-  const orderIndex = countRow.cnt;
+  const countRs = await db.execute({ sql: 'SELECT COUNT(*) as cnt FROM topics WHERE course_id = ?', args: [courseId] });
+  const orderIndex = Number(countRs.rows[0]?.cnt || 0);
 
-  db.prepare(
-    'INSERT INTO topics (id, course_id, title, due_date, completed, completed_at, notes, order_index) VALUES (?, ?, ?, ?, 0, NULL, ?, ?)'
-  ).run(id, courseId, title, dueDate, notes || null, orderIndex);
+  await db.execute({
+    sql: 'INSERT INTO topics (id, course_id, title, due_date, completed, completed_at, notes, order_index) VALUES (?, ?, ?, ?, 0, NULL, ?, ?)',
+    args: [id, courseId, title, dueDate, notes || null, orderIndex],
+  });
 
   res.status(201).json({ success: true, id, message: 'تم إضافة الموضوع بنجاح' });
 });
 
-apiRouter.patch('/topics/:id', (req: Request, res: Response): void => {
+apiRouter.patch('/topics/:id', async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   const topicUpdateSchema = z.object({
     title: z.string().min(1).optional(),
@@ -352,45 +345,38 @@ apiRouter.patch('/topics/:id', (req: Request, res: Response): void => {
     return;
   }
 
-  const existing = db.prepare('SELECT * FROM topics WHERE id = ?').get(id) as {
-    completed: number;
-    completed_at: string | null;
-  } | undefined;
-
-  if (!existing) {
-    res.status(404).json({ error: 'الموضوع غير موجود' });
-    return;
-  }
-
   const { title, dueDate, completed, notes, courseId, orderIndex } = result.data;
 
   if (title !== undefined) {
-    db.prepare('UPDATE topics SET title = ? WHERE id = ?').run(title, id);
+    await db.execute({ sql: 'UPDATE topics SET title = ? WHERE id = ?', args: [title, id] });
   }
   if (dueDate !== undefined) {
-    db.prepare('UPDATE topics SET due_date = ? WHERE id = ?').run(dueDate, id);
+    await db.execute({ sql: 'UPDATE topics SET due_date = ? WHERE id = ?', args: [dueDate, id] });
   }
   if (notes !== undefined) {
-    db.prepare('UPDATE topics SET notes = ? WHERE id = ?').run(notes, id);
+    await db.execute({ sql: 'UPDATE topics SET notes = ? WHERE id = ?', args: [notes, id] });
   }
   if (courseId !== undefined) {
-    db.prepare('UPDATE topics SET course_id = ? WHERE id = ?').run(courseId, id);
+    await db.execute({ sql: 'UPDATE topics SET course_id = ? WHERE id = ?', args: [courseId, id] });
   }
   if (orderIndex !== undefined) {
-    db.prepare('UPDATE topics SET order_index = ? WHERE id = ?').run(orderIndex, id);
+    await db.execute({ sql: 'UPDATE topics SET order_index = ? WHERE id = ?', args: [orderIndex, id] });
   }
   if (completed !== undefined) {
     const isCompleted = completed ? 1 : 0;
     const completedAt = completed ? new Date().toISOString() : null;
-    db.prepare('UPDATE topics SET completed = ?, completed_at = ? WHERE id = ?').run(isCompleted, completedAt, id);
+    await db.execute({
+      sql: 'UPDATE topics SET completed = ?, completed_at = ? WHERE id = ?',
+      args: [isCompleted, completedAt, id],
+    });
   }
 
   res.json({ success: true, message: 'تم تحديث الموضوع بنجاح' });
 });
 
-apiRouter.delete('/topics/:id', (req: Request, res: Response): void => {
+apiRouter.delete('/topics/:id', async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
-  db.prepare('DELETE FROM topics WHERE id = ?').run(id);
+  await db.execute({ sql: 'DELETE FROM topics WHERE id = ?', args: [id] });
   res.json({ success: true, message: 'تم حذف الموضوع بنجاح' });
 });
 
@@ -402,7 +388,7 @@ const rescheduleSchema = z.object({
   days: z.number().int().min(1, 'يجب تحديد يوم واحد على الأقل').max(365, 'الحد الأقصى للتأجيل سنة'),
 });
 
-apiRouter.post('/topics/reschedule', (req: Request, res: Response): void => {
+apiRouter.post('/topics/reschedule', async (req: Request, res: Response): Promise<void> => {
   const result = rescheduleSchema.safeParse(req.body);
   if (!result.success) {
     res.status(400).json({ error: result.error.errors[0].message });
@@ -410,15 +396,17 @@ apiRouter.post('/topics/reschedule', (req: Request, res: Response): void => {
   }
 
   const { days } = result.data;
-  const showPhase2Row = db.prepare('SELECT value FROM settings WHERE key = ?').get('showPhase2') as { value: string } | undefined;
-  const showPhase2 = showPhase2Row?.value === '1';
+  const showPhase2Rs = await db.execute({ sql: 'SELECT value FROM settings WHERE key = ?', args: ['showPhase2'] });
+  const showPhase2 = showPhase2Rs.rows[0]?.value === '1';
 
-  const topics = getAllTopicsWithCourse(showPhase2);
+  const topics = await getAllTopicsWithCourse(showPhase2);
   const shifted = rescheduleIncompleteTopics(topics, days);
 
-  const updateStmt = db.prepare('UPDATE topics SET due_date = ? WHERE id = ?');
   for (const item of shifted) {
-    updateStmt.run(item.newDueDate, item.id);
+    await db.execute({
+      sql: 'UPDATE topics SET due_date = ? WHERE id = ?',
+      args: [item.newDueDate, item.id],
+    });
   }
 
   res.json({
@@ -432,15 +420,15 @@ apiRouter.post('/topics/reschedule', (req: Request, res: Response): void => {
 // Dashboard Metrics Route
 // ==========================================
 
-apiRouter.get('/dashboard/metrics', (_req: Request, res: Response) => {
+apiRouter.get('/dashboard/metrics', async (_req: Request, res: Response) => {
   const todayStr = getCairoTodayString();
-  const showPhase2Row = db.prepare('SELECT value FROM settings WHERE key = ?').get('showPhase2') as { value: string } | undefined;
-  const showPhase2 = showPhase2Row?.value === '1';
+  const showPhase2Rs = await db.execute({ sql: 'SELECT value FROM settings WHERE key = ?', args: ['showPhase2'] });
+  const showPhase2 = showPhase2Rs.rows[0]?.value === '1';
 
-  const startDateRow = db.prepare('SELECT value FROM settings WHERE key = ?').get('planStartDate') as { value: string } | undefined;
-  const planStartDate = startDateRow?.value || '2026-11-06';
+  const startDateRs = await db.execute({ sql: 'SELECT value FROM settings WHERE key = ?', args: ['planStartDate'] });
+  const planStartDate = String(startDateRs.rows[0]?.value || '2026-11-06');
 
-  const topics = getAllTopicsWithCourse(showPhase2);
+  const topics = await getAllTopicsWithCourse(showPhase2);
   const metrics = calculatePlanMetrics(topics, planStartDate, todayStr);
 
   res.json({
@@ -454,21 +442,14 @@ apiRouter.get('/dashboard/metrics', (_req: Request, res: Response) => {
 // Study Log Routes
 // ==========================================
 
-apiRouter.get('/logs', (_req: Request, res: Response) => {
-  const rows = db.prepare('SELECT * FROM study_logs ORDER BY date DESC, created_at DESC').all() as Array<{
-    id: string;
-    date: string;
-    hours: number;
-    notes: string | null;
-    created_at: string;
-  }>;
-
-  const logs: StudyLog[] = rows.map((r) => ({
-    id: r.id,
-    date: r.date,
-    hours: r.hours,
-    notes: r.notes,
-    createdAt: r.created_at,
+apiRouter.get('/logs', async (_req: Request, res: Response) => {
+  const rs = await db.execute('SELECT * FROM study_logs ORDER BY date DESC, created_at DESC');
+  const logs: StudyLog[] = rs.rows.map((r: any) => ({
+    id: String(r.id),
+    date: String(r.date),
+    hours: Number(r.hours),
+    notes: r.notes ? String(r.notes) : null,
+    createdAt: String(r.created_at),
   }));
 
   const todayStr = getCairoTodayString();
@@ -487,7 +468,7 @@ const studyLogSchema = z.object({
   notes: z.string().optional().nullable(),
 });
 
-apiRouter.post('/logs', (req: Request, res: Response): void => {
+apiRouter.post('/logs', async (req: Request, res: Response): Promise<void> => {
   const result = studyLogSchema.safeParse(req.body);
   if (!result.success) {
     res.status(400).json({ error: result.error.errors[0].message });
@@ -498,21 +479,17 @@ apiRouter.post('/logs', (req: Request, res: Response): void => {
   const id = `log-${crypto.randomUUID().slice(0, 8)}`;
   const createdAt = new Date().toISOString();
 
-  // If already logged for this date, add or update
-  db.prepare('INSERT INTO study_logs (id, date, hours, notes, created_at) VALUES (?, ?, ?, ?, ?)').run(
-    id,
-    date,
-    hours,
-    notes || null,
-    createdAt
-  );
+  await db.execute({
+    sql: 'INSERT INTO study_logs (id, date, hours, notes, created_at) VALUES (?, ?, ?, ?, ?)',
+    args: [id, date, hours, notes || null, createdAt],
+  });
 
   res.status(201).json({ success: true, id, message: 'تم تسجيل جلسة المذاكرة بنجاح' });
 });
 
-apiRouter.delete('/logs/:id', (req: Request, res: Response): void => {
+apiRouter.delete('/logs/:id', async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
-  db.prepare('DELETE FROM study_logs WHERE id = ?').run(id);
+  await db.execute({ sql: 'DELETE FROM study_logs WHERE id = ?', args: [id] });
   res.json({ success: true, message: 'تم حذف السجل بنجاح' });
 });
 
@@ -520,19 +497,17 @@ apiRouter.delete('/logs/:id', (req: Request, res: Response): void => {
 // Weekly Report & Heatmap Routes
 // ==========================================
 
-apiRouter.get('/reports/weekly', (_req: Request, res: Response) => {
+apiRouter.get('/reports/weekly', async (_req: Request, res: Response) => {
   const todayStr = getCairoTodayString();
-  const showPhase2Row = db.prepare('SELECT value FROM settings WHERE key = ?').get('showPhase2') as { value: string } | undefined;
-  const showPhase2 = showPhase2Row?.value === '1';
+  const showPhase2Rs = await db.execute({ sql: 'SELECT value FROM settings WHERE key = ?', args: ['showPhase2'] });
+  const showPhase2 = showPhase2Rs.rows[0]?.value === '1';
 
-  const targetHoursRow = db.prepare('SELECT value FROM settings WHERE key = ?').get('targetDailyHours') as { value: string } | undefined;
-  const dailyTarget = parseFloat(targetHoursRow?.value || '2');
+  const targetHoursRs = await db.execute({ sql: 'SELECT value FROM settings WHERE key = ?', args: ['targetDailyHours'] });
+  const dailyTarget = parseFloat(String(targetHoursRs.rows[0]?.value || '2'));
 
   const todayDate = new Date(`${todayStr}T00:00:00Z`);
-  const dayOfWeek = todayDate.getUTCDay(); // 0 is Sunday, 5 is Friday, 6 is Saturday
+  const dayOfWeek = todayDate.getUTCDay();
 
-  // Calculate Saturday as start of week (standard for Middle East / Egypt)
-  // Saturday offset: if Saturday (6), offset 0. If Sunday (0), offset 1 day back.
   const satDiff = (dayOfWeek + 1) % 7;
   const satDate = new Date(todayDate.getTime() - satDiff * 86_400_000);
   const friDate = new Date(satDate.getTime() + 6 * 86_400_000);
@@ -544,33 +519,30 @@ apiRouter.get('/reports/weekly', (_req: Request, res: Response) => {
   const nextWeekStart = nextSatDate.toISOString().slice(0, 10);
   const nextWeekEnd = nextFriDate.toISOString().slice(0, 10);
 
-  const allTopics = getAllTopicsWithCourse(showPhase2);
+  const allTopics = await getAllTopicsWithCourse(showPhase2);
 
-  // Topics completed this week (by completedAt or fallback dueDate)
   const completedThisWeek = allTopics.filter((t) => {
     if (!t.completed) return false;
     const compDate = (t.completedAt || t.dueDate).slice(0, 10);
     return compDate >= weekStart && compDate <= weekEnd;
   });
 
-  // Topics due on or before this week that remain incomplete (overdue)
   const overdueMissed = allTopics.filter((t) => {
     return !t.completed && t.dueDate <= weekEnd;
   });
 
-  // Topics planned for next week
   const nextWeekPlanned = allTopics.filter((t) => {
     return !t.completed && t.dueDate >= nextWeekStart && t.dueDate <= nextWeekEnd;
   });
 
-  // Hours studied this week
-  const studyRows = db.prepare('SELECT hours FROM study_logs WHERE date >= ? AND date <= ?').all(weekStart, weekEnd) as {
-    hours: number;
-  }[];
-  const totalHoursStudiedThisWeek = Math.round(studyRows.reduce((acc, curr) => acc + curr.hours, 0) * 10) / 10;
+  const studyRs = await db.execute({
+    sql: 'SELECT hours FROM study_logs WHERE date >= ? AND date <= ?',
+    args: [weekStart, weekEnd],
+  });
+  const totalHoursStudiedThisWeek =
+    Math.round(studyRs.rows.reduce((acc: number, curr: any) => acc + Number(curr.hours), 0) * 10) / 10;
   const targetHoursThisWeek = dailyTarget * 7;
 
-  // On-time rate for this week
   let onTimeWeek = 0;
   for (const t of completedThisWeek) {
     const compDate = (t.completedAt || t.dueDate).slice(0, 10);
@@ -593,16 +565,15 @@ apiRouter.get('/reports/weekly', (_req: Request, res: Response) => {
   res.json(report);
 });
 
-apiRouter.get('/reports/heatmap', (_req: Request, res: Response) => {
-  const showPhase2Row = db.prepare('SELECT value FROM settings WHERE key = ?').get('showPhase2') as { value: string } | undefined;
-  const showPhase2 = showPhase2Row?.value === '1';
+apiRouter.get('/reports/heatmap', async (_req: Request, res: Response) => {
+  const showPhase2Rs = await db.execute({ sql: 'SELECT value FROM settings WHERE key = ?', args: ['showPhase2'] });
+  const showPhase2 = showPhase2Rs.rows[0]?.value === '1';
 
-  const topics = getAllTopicsWithCourse(showPhase2);
-  const studyRows = db.prepare('SELECT date, hours FROM study_logs').all() as { date: string; hours: number }[];
+  const topics = await getAllTopicsWithCourse(showPhase2);
+  const studyRs = await db.execute('SELECT date, hours FROM study_logs');
 
   const activityMap = new Map<string, { count: number; hours: number }>();
 
-  // Count completed topics by date
   for (const t of topics) {
     if (t.completed && t.completedAt) {
       const d = t.completedAt.slice(0, 10);
@@ -611,15 +582,15 @@ apiRouter.get('/reports/heatmap', (_req: Request, res: Response) => {
     }
   }
 
-  // Add study hours
-  for (const s of studyRows) {
-    const prev = activityMap.get(s.date) || { count: 0, hours: 0 };
-    activityMap.set(s.date, { ...prev, hours: prev.hours + s.hours });
+  for (const s of studyRs.rows) {
+    const d = String(s.date);
+    const hrs = Number(s.hours);
+    const prev = activityMap.get(d) || { count: 0, hours: 0 };
+    activityMap.set(d, { ...prev, hours: prev.hours + hrs });
   }
 
   const result: DailyActivityPoint[] = [];
   activityMap.forEach((val, date) => {
-    // Determine level 0-4
     let level: 0 | 1 | 2 | 3 | 4 = 0;
     const score = val.count * 2 + val.hours;
     if (score > 6) level = 4;
@@ -643,19 +614,19 @@ apiRouter.get('/reports/heatmap', (_req: Request, res: Response) => {
 // Export / Import & Reset Routes
 // ==========================================
 
-apiRouter.get('/backup/export', (_req: Request, res: Response) => {
-  const courses = db.prepare('SELECT * FROM courses').all();
-  const topics = db.prepare('SELECT * FROM topics').all();
-  const studyLogs = db.prepare('SELECT * FROM study_logs').all();
-  const settings = db.prepare('SELECT * FROM settings').all();
+apiRouter.get('/backup/export', async (_req: Request, res: Response) => {
+  const coursesRs = await db.execute('SELECT * FROM courses');
+  const topicsRs = await db.execute('SELECT * FROM topics');
+  const studyLogsRs = await db.execute('SELECT * FROM study_logs');
+  const settingsRs = await db.execute('SELECT * FROM settings');
 
   const exportData = {
     version: 1,
     exportedAt: new Date().toISOString(),
-    courses,
-    topics,
-    studyLogs,
-    settings,
+    courses: coursesRs.rows,
+    topics: topicsRs.rows,
+    studyLogs: studyLogsRs.rows,
+    settings: settingsRs.rows,
   };
 
   res.setHeader('Content-Type', 'application/json');
@@ -663,66 +634,65 @@ apiRouter.get('/backup/export', (_req: Request, res: Response) => {
   res.send(JSON.stringify(exportData, null, 2));
 });
 
-apiRouter.post('/backup/import', (req: Request, res: Response): void => {
+apiRouter.post('/backup/import', async (req: Request, res: Response): Promise<void> => {
   const data = req.body;
   if (!data || !Array.isArray(data.courses) || !Array.isArray(data.topics)) {
     res.status(400).json({ error: 'ملف الاستيراد غير صالح أو مفقود به بيانات الكورسات والمواضيع.' });
     return;
   }
 
-  db.exec('BEGIN TRANSACTION;');
   try {
-    // Clear existing
-    db.exec('DELETE FROM topics;');
-    db.exec('DELETE FROM courses;');
-    db.exec('DELETE FROM study_logs;');
+    await db.executeMultiple(`
+      DELETE FROM topics;
+      DELETE FROM courses;
+      DELETE FROM study_logs;
+    `);
 
-    const insertCourse = db.prepare(
-      'INSERT INTO courses (id, name, color, order_index, phase, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-    );
     for (const c of data.courses) {
-      insertCourse.run(c.id, c.name, c.color, c.order_index ?? 0, c.phase ?? 1, c.created_at || new Date().toISOString());
+      await db.execute({
+        sql: 'INSERT INTO courses (id, name, color, order_index, phase, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        args: [c.id, c.name, c.color, c.order_index ?? 0, c.phase ?? 1, c.created_at || new Date().toISOString()],
+      });
     }
 
-    const insertTopic = db.prepare(
-      'INSERT INTO topics (id, course_id, title, due_date, completed, completed_at, notes, order_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-    );
     for (const t of data.topics) {
-      insertTopic.run(
-        t.id,
-        t.course_id,
-        t.title,
-        t.due_date,
-        t.completed ? 1 : 0,
-        t.completed_at || null,
-        t.notes || null,
-        t.order_index ?? 0
-      );
+      await db.execute({
+        sql: 'INSERT INTO topics (id, course_id, title, due_date, completed, completed_at, notes, order_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        args: [
+          t.id,
+          t.course_id,
+          t.title,
+          t.due_date,
+          t.completed ? 1 : 0,
+          t.completed_at || null,
+          t.notes || null,
+          t.order_index ?? 0,
+        ],
+      });
     }
 
     if (Array.isArray(data.studyLogs)) {
-      const insertLog = db.prepare(
-        'INSERT INTO study_logs (id, date, hours, notes, created_at) VALUES (?, ?, ?, ?, ?)'
-      );
       for (const l of data.studyLogs) {
-        insertLog.run(l.id, l.date, l.hours, l.notes || null, l.created_at || new Date().toISOString());
+        await db.execute({
+          sql: 'INSERT INTO study_logs (id, date, hours, notes, created_at) VALUES (?, ?, ?, ?, ?)',
+          args: [l.id, l.date, l.hours, l.notes || null, l.created_at || new Date().toISOString()],
+        });
       }
     }
 
     if (Array.isArray(data.settings)) {
-      const insertSetting = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
       for (const s of data.settings) {
-        // do not overwrite passwordHash unless specified
         if (s.key !== 'passwordHash') {
-          insertSetting.run(s.key, s.value);
+          await db.execute({
+            sql: 'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+            args: [s.key, s.value],
+          });
         }
       }
     }
 
-    db.exec('COMMIT;');
     res.json({ success: true, message: 'تم استيراد البيانات بنجاح.' });
   } catch (err: any) {
-    db.exec('ROLLBACK;');
     res.status(500).json({ error: 'فشل استيراد البيانات: ' + err.message });
   }
 });
@@ -731,15 +701,14 @@ const resetSchema = z.object({
   confirmPhrase: z.string(),
 });
 
-apiRouter.post('/reset', (req: Request, res: Response): void => {
+apiRouter.post('/reset', async (req: Request, res: Response): Promise<void> => {
   const result = resetSchema.safeParse(req.body);
   if (!result.success || result.data.confirmPhrase !== 'إعادة ضبط') {
     res.status(400).json({ error: 'يرجى كتابة "إعادة ضبط" للتأكيد.' });
     return;
   }
 
-  // Clear completed flags and study logs
-  db.exec(`
+  await db.executeMultiple(`
     UPDATE topics SET completed = 0, completed_at = NULL;
     DELETE FROM study_logs;
   `);
