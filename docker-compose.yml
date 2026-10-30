@@ -1,0 +1,22 @@
+services:
+  devops-tracker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: devops-tracker:latest
+    container_name: devops-tracker
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - JWT_SECRET=${JWT_SECRET:-devops-tracker-prod-jwt-secret-key-2027}
+      - APP_PASSWORD=${APP_PASSWORD:-devops2027}
+      - DATABASE_PATH=/app/data/tracker.db
+    volumes:
+      - devops-data:/app/data
+
+volumes:
+  devops-data:
+    name: devops-tracker-sqlite-data
